@@ -1,0 +1,166 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+xecuting this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+library(tidyverse)
+library(data.table)
+```
+
+```{r}
+# options("scipen"=100, "digits"=4)
+path = "data/train/2020-05-28-US-MTV-2/GooglePixel4/"
+gnss_df = read.csv(paste0(path, "device_gnss.csv")) |> setDT()
+```
+
+```{r}
+WGS84_SEMI_MAJOR_AXIS = 6378137.0
+WGS84_SEMI_MINOR_AXIS = 6356752.314245
+WGS84_SQUARED_FIRST_ECCENTRICITY  = 6.69437999013e-3
+WGS84_SQUARED_SECOND_ECCENTRICITY = 6.73949674226e-3
+
+HAVERSINE_RADIUS = 6371000
+
+```
+
+```{r ECEF}
+# Convert into matrix with x,y,z
+ECEF <- function(gnss_df) {
+  xyz_col = gnss_df[, grep("WlsPosition", colnames(gnss_df), value = TRUE)]
+  
+  ECEF = gnss_df[, ..xyz_col] |> as.matrix()
+  colnames(ECEF) <- c("x", "y", "z")
+  return(ECEF)
+}
+```
+
+```{r}
+
+# Converts x,y,z to WGS84 BLH
+ECEF_to_BLH <- function(ecef){
+    a = WGS84_SEMI_MAJOR_AXIS
+    b = WGS84_SEMI_MINOR_AXIS
+    e2  = WGS84_SQUARED_FIRST_ECCENTRICITY
+    e2_ = WGS84_SQUARED_SECOND_ECCENTRICITY
+    x = ecef[, "x"]
+    y = ecef[, "y"]
+    z = ecef[, "z"]
+    r = sqrt(x**2 + y**2)
+    t = atan2(z * (a/b), r)
+    B = atan2(z + (e2_*b)*sin(t)**3, r - (e2*a)*cos(t)**3)
+    L = atan2(y, x)
+    n = a / sqrt(1 - e2*sin(B)**2)
+    H = (r / cos(B)) - n
+    # return BLH(lat=B, lng=L, hgt=H)
+    fixed = matrix(c(B,L,H), ncol = 3)
+    colnames(fixed) <- c("lat", "lng", "hgt")
+    return(fixed)
+}
+
+haversine_distance <- function(blh_1, blh_2){
+    dlat = blh_2[,"lat"] - blh_1[,"lat"]
+    dlng = blh_2[,"lng"] - blh_1[,"lng"]
+    a = sin(dlat/2)**2 + cos(blh_1[,"lat"]) * cos(blh_2[,"lat"]) * sin(dlng/2)**2
+    dist = 2 * HAVERSINE_RADIUS * asin(sqrt(a)) #was arcsin()
+    return (dist)
+}
+
+pandas_haversine_distance <- function(df1, df2) {
+  ## pred_df
+  blh1 = matrix(c(pracma::deg2rad(df1[, 'LatitudeDegrees']),
+                     pracma::deg2rad(df1[, 'LongitudeDegrees'])),
+                   ncol = 2) # REMOVE hgt
+  blh1 = cbind(blh1, hgt = 0)
+  colnames(blh1) <- c("lat", "lng", "hgt")
+  blh2 = matrix(c(pracma::deg2rad(unlist(df2[, 'LatitudeDegrees'])),
+                     pracma::deg2rad(unlist(df2[, 'LongitudeDegrees']))),
+                   ncol = 2)
+  blh2 = cbind(blh2, hgt = 0)
+  colnames(blh2) <- c("lat", "lng", "hgt")
+  return(haversine_distance(blh1, blh2))
+}
+# Inputs raw gnss file, convert to BLH and lat/lng. UnixTimeMillis is from ground_truth
+# Also removes duplicated UnixTimeMillis and smooth
+ecef_to_lat_lng <- function(tripID, gnss_df, UnixTimeMillis){
+    ecef_columns = c('WlsPositionXEcefMeters', 'WlsPositionYEcefMeters', 'WlsPositionZEcefMeters')
+    columns = c('utcTimeMillis', ecef_columns)
+    # ecef_df = (gnss_df.drop_duplicates(subset='utcTimeMillis')[columns]
+    #            .dropna().reset_index(drop=True))
+    
+    ecef_df = gnss_df[!duplicated(utcTimeMillis), ..columns][!is.na(utcTimeMillis)] ## dropna??
+    
+    ecef = ecef_df[, ..ecef_columns]
+    ecef = ECEF(ecef)
+    # ecef = ECEF.from_numpy(ecef_df[ecef_columns].to_numpy())
+    blh  = ECEF_to_BLH(ecef)
+
+    TIME = ecef_df[, 'utcTimeMillis'] |> as.matrix() |> as.numeric()
+    # lat = InterpolatedUnivariateSpline(TIME, blh.lat, ext=3)(UnixTimeMillis)
+    # lng = InterpolatedUnivariateSpline(TIME, blh.lng, ext=3)(UnixTimeMillis)
+
+    lat = pracma::interp1(TIME, blh[, "lat"], method = "cubic")
+    lng = pracma::interp1(TIME, blh[, "lng"], method = "cubic")
+    
+    # What does it interpolate ??
+    both = cbind(blh[, "lat"], lat)
+    both[ , diff := V1-lat]
+    
+    data.frame('tripId' = tripID,
+        'UnixTimeMillis' = UnixTimeMillis,
+        'LatitudeDegrees' = pracma::rad2deg(lat),
+        'LongitudeDegrees'= pracma::rad2deg(lng))
+}
+ecef_to_lat_lng(tripID = "123", gnss_df, 22222)
+
+
+calc_score <- function(tripID, pred_df, gt_df) {
+  d = pandas_haversine_distance(pred_df, gt_df)
+  score = mean(c(quantile(d, .5, na.rm = T), quantile(d, .95, na.rm = T)), na.rm = T)
+  #     score = np.mean([np.quantile(d, 0.50), np.quantile(d, 0.95)])
+  return (data.frame(tripID, score))
+}
+```
+
+```{r}
+pred_dfs = data.frame()
+score_list = data.frame()
+
+# only 1
+x = list.files(path="data/train/", pattern = "device_gnss.csv$", recursive = TRUE, full.names=T)[7]
+dirname = x
+for (dirname in sort(
+  list.files(
+    path = "data/train/",
+    pattern = "device_gnss.csv$",
+    recursive = TRUE,
+    full.names = T
+  )
+)) {
+  name = gsub("data/train//", '', dirname)
+  tripID  = unlist(str_split(name, "/"))[1:2] |> paste(collapse = '/')
+  gnss_df = read.csv(dirname) |> setDT()
+  gt_df   = read.csv(gsub("device_gnss", "ground_truth", dirname)) |> setDT()
+  
+  # Adjusted
+  pred_df = ecef_to_lat_lng(tripID, gnss_df, gt_df[, 'UnixTimeMillis'])
+  pred_dfs = bind_rows(pred_dfs, pred_df)
+  score = calc_score(tripID, pred_df, gt_df)
+  # print(f'{tripID:<45}: score = {score:.3f}')
+  score_list = bind_rows(score_list, score)
+}
+
+score_list
+```
+```{r}
+mat = ECEF_to_BLH(ECEF(gnss_df)) |> as.data.frame()
+ecef_to_lat_lng("test1", gnss_df =  mat, UnixTimeMillis = gt_df[, 'UnixTimeMillis'])
+
+ggplot(mat) +
+  geom_point(aes(x = lat, y = lng))
+
+ggplot(pred_df) +
+  geom_point(aes(x = LatitudeDegrees, y = LongitudeDegrees )) +
+  geom_point(data = gt_df, aes(x = LatitudeDegrees, y = LongitudeDegrees), color = "red")
+```
