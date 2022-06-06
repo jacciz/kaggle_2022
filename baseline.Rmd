@@ -1,8 +1,21 @@
 ---
-title: "R Notebook"
-output: html_notebook
+title: "Baseline exploration"
+output:
+  html_document:
+    df_print: paged
 ---
-xecuting this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+This is to make a baseline. Same code as here, just written in R.
+https://www.kaggle.com/code/saitodevel01/gsdc2-baseline-submission
+And here:
+https://www.kaggle.com/code/ravishah1/gsdc2-savgol-filter-outlier-removal-with-bo
+
+Get base station observations: https://www.ngs.noaa.gov/UFCORS/
+Navigation data for GNSS constellations: https://igs.bkg.bund.de/root_ftp/IGS/BRDC/
+
+```{r Setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, comment = NA, warning = FALSE, error = FALSE, message = FALSE, tidy = TRUE, fig.dim = c(10, 6), global.par = TRUE)
+```
 
 ```{r}
 library(tidyverse)
@@ -10,23 +23,15 @@ library(data.table)
 ```
 
 ```{r}
-# options("scipen"=100, "digits"=4)
-path = "data/train/2020-05-28-US-MTV-2/GooglePixel4/"
-gnss_df = read.csv(paste0(path, "device_gnss.csv")) |> setDT()
-```
-
-```{r}
 WGS84_SEMI_MAJOR_AXIS = 6378137.0
 WGS84_SEMI_MINOR_AXIS = 6356752.314245
 WGS84_SQUARED_FIRST_ECCENTRICITY  = 6.69437999013e-3
 WGS84_SQUARED_SECOND_ECCENTRICITY = 6.73949674226e-3
-
 HAVERSINE_RADIUS = 6371000
-
 ```
 
 ```{r ECEF}
-# Convert into matrix with x,y,z
+# Convert into matrix with x,y,z. Needs raw 'WlsPosition' for colnames.
 ECEF <- function(gnss_df) {
   xyz_col = gnss_df[, grep("WlsPosition", colnames(gnss_df), value = TRUE)]
   
@@ -37,8 +42,7 @@ ECEF <- function(gnss_df) {
 ```
 
 ```{r}
-
-# Converts x,y,z to WGS84 BLH
+# Converts x,y,z to WGS84 BLH. Needs xyz for colnames. Outputs lat/lng/hgt colnames.
 ECEF_to_BLH <- function(ecef){
     a = WGS84_SEMI_MAJOR_AXIS
     b = WGS84_SEMI_MINOR_AXIS
@@ -59,6 +63,7 @@ ECEF_to_BLH <- function(ecef){
     return(fixed)
 }
 
+# Finds distance bwn predicted and ground truth
 haversine_distance <- function(blh_1, blh_2){
     dlat = blh_2[,"lat"] - blh_1[,"lat"]
     dlng = blh_2[,"lng"] - blh_1[,"lng"]
@@ -67,10 +72,11 @@ haversine_distance <- function(blh_1, blh_2){
     return (dist)
 }
 
+# Returns list of numbers of distances for each lat/lng. Input is predicted and raw with LatitudeDegrees/LongitudeDegrees as colnames.
 pandas_haversine_distance <- function(df1, df2) {
   ## pred_df
-  blh1 = matrix(c(pracma::deg2rad(df1[, 'LatitudeDegrees']),
-                     pracma::deg2rad(df1[, 'LongitudeDegrees'])),
+  blh1 = matrix(c(pracma::deg2rad(unlist(df1[, 'LatitudeDegrees'])),
+                     pracma::deg2rad(unlist(df1[, 'LongitudeDegrees']))),
                    ncol = 2) # REMOVE hgt
   blh1 = cbind(blh1, hgt = 0)
   colnames(blh1) <- c("lat", "lng", "hgt")
@@ -81,86 +87,292 @@ pandas_haversine_distance <- function(df1, df2) {
   colnames(blh2) <- c("lat", "lng", "hgt")
   return(haversine_distance(blh1, blh2))
 }
-# Inputs raw gnss file, convert to BLH and lat/lng. UnixTimeMillis is from ground_truth
-# Also removes duplicated UnixTimeMillis and smooth
+# Inputs raw gnss file, convert to BLH and lat/lng. UnixTimeMillis is from ground_truth.  Needs raw 'WlsPosition' for colnames. Output colnames is for score_card.
+# Also removes duplicated UnixTimeMillis and smooths
 ecef_to_lat_lng <- function(tripID, gnss_df, UnixTimeMillis){
     ecef_columns = c('WlsPositionXEcefMeters', 'WlsPositionYEcefMeters', 'WlsPositionZEcefMeters')
     columns = c('utcTimeMillis', ecef_columns)
     # ecef_df = (gnss_df.drop_duplicates(subset='utcTimeMillis')[columns]
     #            .dropna().reset_index(drop=True))
     
-    ecef_df = gnss_df[!duplicated(utcTimeMillis), ..columns][!is.na(utcTimeMillis)] ## dropna??
+    ecef_df = gnss_df[!is.na(utcTimeMillis)][!duplicated(utcTimeMillis), ..columns] ## dropna??[!is.na(WlsPositionXEcefMeters)]
     
+    # Duplicated Time ??
+    # dup_time = gnss_df |> count(utcTimeMillis) |> arrange(-n) |> head(1)
+    # dup = gnss_df[utcTimeMillis == dup_time$utcTimeMillis]
+
     ecef = ecef_df[, ..ecef_columns]
     ecef = ECEF(ecef)
-    # ecef = ECEF.from_numpy(ecef_df[ecef_columns].to_numpy())
     blh  = ECEF_to_BLH(ecef)
 
     TIME = ecef_df[, 'utcTimeMillis'] |> as.matrix() |> as.numeric()
     # lat = InterpolatedUnivariateSpline(TIME, blh.lat, ext=3)(UnixTimeMillis)
     # lng = InterpolatedUnivariateSpline(TIME, blh.lng, ext=3)(UnixTimeMillis)
-
+    
+    # Fill in na ??
     lat = pracma::interp1(TIME, blh[, "lat"], method = "cubic")
     lng = pracma::interp1(TIME, blh[, "lng"], method = "cubic")
     
-    # What does it interpolate ??
-    both = cbind(blh[, "lat"], lat)
-    both[ , diff := V1-lat]
+    lat |> as.data.frame() |> filter(is.na(lat))
+    
+    # What does it interpolate ? I see difference between raw and adjusted is 0
+    # both = cbind(raw = blh[, "lng"], lng)
+    # both = cbind(both,  diff =  both[,1] - both[, 2])
+    # both[ both[, 'diff'] != 0 ]
     
     data.frame('tripId' = tripID,
         'UnixTimeMillis' = UnixTimeMillis,
         'LatitudeDegrees' = pracma::rad2deg(lat),
         'LongitudeDegrees'= pracma::rad2deg(lng))
 }
-ecef_to_lat_lng(tripID = "123", gnss_df, 22222)
+# ecef_to_lat_lng(tripID = "123", gnss_df, 22222)
 
-
+# Calculates score for each trip. Returns tripID and score.
 calc_score <- function(tripID, pred_df, gt_df) {
   d = pandas_haversine_distance(pred_df, gt_df)
   score = mean(c(quantile(d, .5, na.rm = T), quantile(d, .95, na.rm = T)), na.rm = T)
-  #     score = np.mean([np.quantile(d, 0.50), np.quantile(d, 0.95)])
+  
   return (data.frame(tripID, score))
 }
 ```
 
-```{r}
-pred_dfs = data.frame()
-score_list = data.frame()
+# Phone info
+
+```{r eval=FALSE, include=FALSE}
+# pred_dfs = data.frame()
+# score_list = data.frame()
 
 # only 1
-x = list.files(path="data/train/", pattern = "device_gnss.csv$", recursive = TRUE, full.names=T)[7]
+x = list.files(path="data/train", pattern = "device_gnss.csv$", recursive = TRUE, full.names=T)[34]
 dirname = x
-for (dirname in sort(
-  list.files(
-    path = "data/train/",
-    pattern = "device_gnss.csv$",
-    recursive = TRUE,
-    full.names = T
-  )
-)) {
-  name = gsub("data/train//", '', dirname)
+# Open raw files
+  name = gsub("data/train/", '', dirname)
   tripID  = unlist(str_split(name, "/"))[1:2] |> paste(collapse = '/')
   gnss_df = read.csv(dirname) |> setDT()
   gt_df   = read.csv(gsub("device_gnss", "ground_truth", dirname)) |> setDT()
   
   # Adjusted
   pred_df = ecef_to_lat_lng(tripID, gnss_df, gt_df[, 'UnixTimeMillis'])
-  pred_dfs = bind_rows(pred_dfs, pred_df)
+  # pred_dfs = bind_rows(pred_dfs, pred_df)
   score = calc_score(tripID, pred_df, gt_df)
   # print(f'{tripID:<45}: score = {score:.3f}')
-  score_list = bind_rows(score_list, score)
-}
+  # score_list = bind_rows(score_list, score)
+# }
 
-score_list
+score
 ```
-```{r}
-mat = ECEF_to_BLH(ECEF(gnss_df)) |> as.data.frame()
-ecef_to_lat_lng("test1", gnss_df =  mat, UnixTimeMillis = gt_df[, 'UnixTimeMillis'])
 
+```{r}
+# only 1
+x = list.files(path="data/train", pattern = "device_gnss.csv$", recursive = TRUE, full.names=T)[11]
+dirname = x
+open_data <- function(dirname, type = "gnss"){
+  name = gsub("data/train/", '', dirname)
+  tripID  = unlist(str_split(name, "/"))[1:2] |> paste(collapse = '/')
+  gnss_df = read.csv(dirname) |> setDT()
+  gt_df   = read.csv(gsub("device_gnss", "ground_truth", dirname)) |> setDT()
+  
+  # Adjusted to then lat lat/lng
+  pred_df = ecef_to_lat_lng(tripID, gnss_df, gt_df[, 'UnixTimeMillis']) |> setDT()
+  score = calc_score(tripID, pred_df, gt_df) # need tripID??
+  return(score)
+}
+purrr::map_df(x, open_data)
+```
+
+```{r ggplot them, eval=FALSE, include=FALSE}
+mat = ECEF_to_BLH(ECEF(gnss_df)) |> as.data.frame()
+
+# raw
 ggplot(mat) +
   geom_point(aes(x = lat, y = lng))
-
-ggplot(pred_df) +
-  geom_point(aes(x = LatitudeDegrees, y = LongitudeDegrees )) +
-  geom_point(data = gt_df, aes(x = LatitudeDegrees, y = LongitudeDegrees), color = "red")
 ```
+
+# Plot of cleaned (green) vs ground truth (red)
+
+```{r eval=FALSE, include=FALSE}
+ggplot(pred_df) +
+  geom_point(aes(x = LatitudeDegrees, y = LongitudeDegrees ), color = "red") +
+  geom_point(data = gt_df, aes(x = LatitudeDegrees, y = LongitudeDegrees), color = "green", size = .5)
+```
+
+```{r map them, eval=FALSE, include=FALSE}
+library(mapview)
+
+pred_sf = sf::st_as_sf(
+    x = pred_df,
+    coords = c("LongitudeDegrees", "LatitudeDegrees"),
+    crs = 4326,
+    na.fail = FALSE
+  )
+
+gt_sf = sf::st_as_sf(
+    x = gt_df,
+    coords = c("LongitudeDegrees", "LatitudeDegrees"),
+    crs = 4326,
+    na.fail = FALSE
+  )
+mapviewOptions(basemaps = c('Esri.WorldImagery'))
+mapview(pred_sf, col.regions = "red") + mapview(gt_sf, col.regions = "green") 
+```
+
+```{r one point multiple satellites, eval=FALSE, include=FALSE}
+    dup_time = gnss_df |> count(utcTimeMillis) |> arrange(-n) |> head(1)
+    dup = gnss_df[utcTimeMillis == dup_time$utcTimeMillis]
+    dup$Cn0DbHz
+    # WlsPositionXEcefMeters - user position by WLS
+    # point positioning uses pseudorange
+```
+
+```{r outlier}
+calc_haversine <- function(lat1, lon1, lat2, lon2){
+    # """Calculates the great circle distance between two points
+    # on the earth. Inputs are array-like and specified in decimal degrees.
+    # """
+    RADIUS = 6367000
+    # lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+    coor = sapply(c(lat1, lat2, lon1, lon2), pracma::deg2rad)
+    colnames(coor) <- c("lat1", "lat2", "lon1", "lon2")
+    # print(coor)
+    # pracma::deg2rad(lat1)
+    # sapply(c(lat1, lat2), pracma::deg2rad)
+    dlat = coor[, 'lat2'] - coor[, 'lat1']
+    dlon = coor[, 'lon2'] - coor[, 'lon1']
+    # dlat = c["lat2.LatitudeDegrees"] - c["lat1.latDeg_pre"]
+    # dlon = c["lon2.LongitudeDegrees"] - c["lon1.lngDeg_pre"]
+    a = sin(dlat/2)**2 + cos(coor[, 'lat1']) * cos(coor[, 'lat2']) * sin(dlon/2)**2
+    dist = 2 * RADIUS * asin(a**0.5)
+    return (dist)
+}
+
+correct_outliers <- function(df, th = 2) {
+  # df = pred_df
+  df[, c("latDeg_pre", "latDeg_pro", "lngDeg_pre", "lngDeg_pro") := .(
+    shift(LatitudeDegrees, fill = 0, n = 1),
+    shift(LatitudeDegrees, fill = 0, n = -1),
+    shift(LongitudeDegrees, fill = 0, n = 1),
+    lngDeg_pro = shift(LongitudeDegrees, fill = 0, n = -1)
+  )]
+  df[, 'dist_pre'] = calc_haversine(df[, 'latDeg_pre'], df[, 'lngDeg_pre'],
+                                    df[, 'LatitudeDegrees'], df[, 'LongitudeDegrees'])
+  df[, 'dist_pro'] = calc_haversine(df[, 'LatitudeDegrees'], df[, 'LongitudeDegrees'], df[, 'latDeg_pro'], df[, 'lngDeg_pro'])
+  
+  df[df[, dist_pre] == min(df[, dist_pre]), ][ , 'dist_pre'] <- 0
+  df[df[, dist_pro] == max(df[, dist_pro]), ][ , 'dist_pro'] <- 0
+  
+  # Looks for distances 2x sd, and take mean of values before/after point.
+  pro_95 = mean(df$dist_pro, na.rm = T) + sd(df$dist_pro) * th
+  pre_95 = mean(df$dist_pre, na.rm = T) + sd(df$dist_pre) * th
+  
+  ind = df[((df[, dist_pro] > pro_95) &
+             (df[, dist_pre] > pre_95))][, c('dist_pre', 'dist_pro')]
+
+  # returns actual index
+  # is.na(df$LatitudeDegrees) |> which()
+  
+  #is.na ?? I add that
+  ind = which(df$dist_pre == ind$dist_pre &
+                df$dist_pro == ind$dist_pro,
+              arr.ind = T)
+  # ind = c(ind, which(is.na(df$LatitudeDegrees)))
+  for (i in ind) {
+    df[i, 'LatitudeDegrees'] = mean(df[i - 1]$'LatitudeDegrees', df[i + 1]$'LatitudeDegrees', na.rm = T)
+    df[i]$'LongitudeDegrees' = mean(df[i - 1]$'LongitudeDegrees', df[i +
+                                                                         1, 'LongitudeDegrees'], na.rm = T)
+  }
+  return(df)
+}
+```
+
+```{r savgol filter}
+# pracma also has savgol, but may not match
+apply_savgol_filter <- function(df, wl, poly) {
+  df$LatitudeDegrees = signal::sgolayfilt(df$LatitudeDegrees, n = wl, p = poly)
+  df$LongitudeDegrees = signal::sgolayfilt(df$LongitudeDegrees, n = wl, p = poly)
+  return(df)
+}
+```
+
+```{r bayesian optimization}
+# optimize <- function(threshold, window_len, polyorder) {
+optimize <- function(params) {
+  threshold = unlist(params[1])
+  window_len = unlist(params[2])
+  polyorder = unlist(params[3])
+  # print(threshold)
+  # window_len = as.integer(window_len)
+  # must be odd
+  if (window_len %% 2 == 0) {
+    window_len = window_len + 1
+  }
+  # threshold = 2
+  # polyorder = 3
+  score_list = data.frame()
+  #
+  # all_tridIDs = sort(unique(tripID))
+  # for (tripID in all_tridIDs) {
+  # gt_df = read.csv(paste0("data/train/", tripID, "/ground_truth.csv"))
+  # pred_df = bl_train[bl_train.tripId == tripID] ?
+  
+  # We are using BLH, not ECEF to optimize
+  pred_df = correct_outliers(pred_df, threshold)
+  pred_df = apply_savgol_filter(pred_df, window_len, polyorder)
+  
+  score = calc_score(tripID, pred_df, gt_df)
+  score_list = bind_rows(score_list, score)
+  # }
+  mean_score = mean(score_list$score)
+  return (mean_score)
+  # score
+}
+
+optimize(5,3,1) # WORKS
+```
+
+```{r}
+# https://rpubs.com/Argaadya/bayesian-optimization
+space = list(threshold = c(1.5, 2.5), 
+         window_len = c(7, 31),
+         poly_order = c(2, 6))
+# search_grid <- data.frame(threshhold = runif(20,1.5,2.5), 
+#                           window_len = runif(20,7,31),
+#                           poly_order = runif(20,2,6))
+rBayesianOptimization::BayesianOptimization(FUN = optimize, bounds = space, n_iter = 2)
+```
+
+```{r test, eval=FALSE, include=FALSE}
+space = list(window_len = c(7, 31))
+# search_grid <- list(window_len = runif(20, 7, 31))
+
+optimize <- function(window_len) {
+  # print(window_len)
+  window_len = as.integer(window_len)
+  if (window_len %% 2 == 0) {
+    window_len = window_len + 1
+  }
+  window_len
+}
+# doesnt work, but python works
+rBayesianOptimization::BayesianOptimization(FUN = optimize, bounds = space, n_iter = 5)
+```
+
+
+```{python}
+from skopt import gp_minimize
+from skopt.space import Real, Integer
+
+space = [Real(1.5, 2.5, name='threshold'), 
+         Integer(7, 31, name='window_len'), 
+         Integer(2, 6, name='poly_order')]
+         
+# space = [Real(1.5, 2.5, name='threshold'), Integer(7, 31, name='window_len')]
+result = gp_minimize(r.optimize, space, n_calls=10) # works in test optimize
+r.optimize(space)
+```
+
+
+
+
+
+
+
