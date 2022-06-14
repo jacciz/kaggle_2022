@@ -1,0 +1,460 @@
+---
+title: "Baseline exploration"
+output:
+  html_document:
+    df_print: paged
+---
+
++ Different radius - pandas_haversine_distance() & calc_haversine(). Could just use geosphere::distHaversine()? 
++ Closer points seems to jitter 
++ use geosphere::distVincentyEllipsoid over halversine? 
+
+Based on: https://www.kaggle.com/code/taroz1461/carrier-smoothing-robust-wls-kalman-smoother
+
+```{r eval=FALSE, include=FALSE}
+# This is to make a baseline. Same code as here, just written in R. <https://www.kaggle.com/code/saitodevel01/gsdc2-baseline-submission> And here: <https://www.kaggle.com/code/ravishah1/gsdc2-savgol-filter-outlier-removal-with-bo>
+
+# Get base station observations: <https://www.ngs.noaa.gov/UFCORS/> Navigation data for GNSS constellations: <https://igs.bkg.bund.de/root_ftp/IGS/BRDC/>
+
+# Look for smoothing techniques
+# other interpolation methods - for NAs
+# integrating IMU and gnss
+```
+
+```{r Setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, comment = NA, warning = FALSE, error = FALSE, message = FALSE, tidy = TRUE, fig.dim = c(10, 6), global.par = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(data.table)
+
+# source("baseline_functions.R")
+source("helper_functions.R")
+# source("outliers_and_smoothing.R")
+
+# Constants
+CLIGHT = 299792458   # speed of light (m/s)
+RE_WGS84 = 6378137   # earth semimajor axis (WGS84) (m)
+OMGE = 7.2921151467E-5  # earth angular velocity (IS-GPS) (rad/s)
+```
+
+
+Raw score
+```{r open data}
+blh_df = read_rds( "data/train/cleaned_to_blh.rds")
+
+trip_ids = unique(blh_df$tripID)#
+
+# select one phone
+one_trip = trip_ids[46]
+path = "data/train/"
+gnss_df = read.csv(paste0(path, one_trip, "/device_gnss.csv")) |> setDT()
+
+# gt = open_gt(trip_ids)
+# raw_df = blh_df[tripID == trip_ids]
+# calc_score(trip_ids, raw_df)
+```
+
+```{r satellit selection}
+# Satellite selection using carrier frequency error, elevation angle, and C/N0
+# TODO CarrierErrorHz not in df ??
+satellite_selection <- function(gnss_df, column) {
+  "
+    Args:
+        df : DataFrame from device_gnss.csv
+        column : Column name
+    Returns:
+        df: DataFrame with eliminated satellite signals
+    "
+  # Returns booleon for isNull
+  # idx = df[column].notnull()
+  # # Row number for parameter
+  # idx &= df['CarrierErrorHz'] < 2.0e6  # carrier frequency error (Hz) 
+  #
+  match = which(!is.na(gnss_df[[column]]) &
+                  gnss_df[["SvElevationDegrees"]] > 10.0 &
+                  gnss_df[["Cn0DbHz"]] > 15.0 &
+                  gnss_df[["MultipathIndicator"]] == 0,
+                arr.ind = T)
+  
+  # Returns matching row
+  return(gnss_df[match])
+}
+```
+
+```{r residuals and jacobian}
+# Compute line-of-sight vector from user to satellite
+# input is a matrix?
+los_vector <- function(xusr, xsat){
+    "
+    Args:
+        xusr : user position in ECEF (m)
+        xsat : satellite position in ECEF (m)
+    Returns:
+        u: unit line-of-sight vector in ECEF (m)
+        rng: distance between user and satellite (m)
+    "
+    "u = xsat - xusr
+    rng = np.linalg.norm(u, axis=1).reshape(-1, 1)
+    u /= rng
+    
+    return u, rng.reshape(-1)"
+}
+norm(m, type = "O") # one norm, no argument for axis
+m = matrix(c(1,2,5,4,5,6), ncol = 2, nrow = 3)
+m
+n = pracma::Norm(m) 
+
+u = m
+# use this?? what is the input?
+rng = apply(m, 1, pracma::Norm) |>  matrix(dimnames=list(t(outer(colnames(m), rownames(m), FUN=paste)), NULL))
+u = u / rng
+```
+```{python}
+idx = r.gnss_df["Svid"].notnull()
+idx &= r.gnss_df['Cn0DbHz'] > 15.0 
+
+import pandas as pd
+import numpy as np
+u = r.m
+rng = np.linalg.norm(r.m, axis=1).reshape(-1, 1)
+    u /= rng
+    u, rng.reshape(-1)
+```
+
+
+```{r jacobian}
+# Compute Jacobian matrix
+jac_pr_residuals <- function(x, xsat, pr, W){
+    "
+    Args:
+        x : current position in ECEF (m)
+        xsat : satellite position in ECEF (m)
+        pr : pseudorange (m)
+        W : weight matrix
+    Returns:
+        W*J : Jacobian matrix
+    "
+    u, _ = los_vector(x[:3], xsat)
+    J = np.hstack([-u, np.ones([len(pr), 1])])  # J = [-ux -uy -uz 1]
+
+    return W @ J
+}
+
+# Compute pseudorange residuals
+def pr_residuals(x, xsat, pr, W):
+    """
+    Args:
+        x : current position in ECEF (m)
+        xsat : satellite position in ECEF (m)
+        pr : pseudorange (m)
+        W : weight matrix
+    Returns:
+        residuals*W : pseudorange residuals
+    """
+    u, rng = los_vector(x[:3], xsat)
+
+    # Approximate correction of the earth rotation (Sagnac effect) often used in GNSS positioning
+    rng += OMGE * (xsat[:, 0] * x[1] - xsat[:, 1] * x[0]) / CLIGHT
+
+    # Add GPS L1 clock offset
+    residuals = rng - (pr - x[3])
+
+    return residuals @ W
+
+
+# Compute Jacobian matrix
+def jac_prr_residuals(v, vsat, prr, x, xsat, W):
+    """
+    Args:
+        v : current velocity in ECEF (m/s)
+        vsat : satellite velocity in ECEF (m/s)
+        prr : pseudorange rate (m/s)
+        x : current position in ECEF (m)
+        xsat : satellite position in ECEF (m)
+        W : weight matrix
+    Returns:
+        W*J : Jacobian matrix
+    """
+    u, _ = los_vector(x[:3], xsat)
+    J = np.hstack([-u, np.ones([len(prr), 1])])
+
+    return np.dot(W, J)
+
+
+# Compute pseudorange rate residuals
+def prr_residuals(v, vsat, prr, x, xsat, W):
+    """
+    Args:
+        v : current velocity in ECEF (m/s)
+        vsat : satellite velocity in ECEF (m/s)
+        prr : pseudorange rate (m/s)
+        x : current position in ECEF (m)
+        xsat : satellite position in ECEF (m)
+        W : weight matrix
+    Returns:
+        residuals*W : pseudorange rate residuals
+    """
+    u, rng = los_vector(x[:3], xsat)
+    rate = np.sum((vsat-v[:3])*u, axis=1) \
+          + OMGE / CLIGHT * (vsat[:, 1] * x[0] + xsat[:, 1] * v[0]
+                           - vsat[:, 0] * x[1] - xsat[:, 0] * v[1])
+
+    residuals = rate - (prr - v[3])
+
+    return residuals @ W
+```
+
+```{r smoothing}
+# Carrier smoothing of pseudarange
+carrier_smoothing <- function(gnss_df){
+    "
+    Args:
+        df : DataFrame from device_gnss.csv
+    Returns:
+        df: DataFrame with carrier-smoothing pseudorange 'pr_smooth'
+    "
+    carr_th = 2.0 # carrier phase jump threshold [m]
+    pr_th =  20.0 # pseudorange jump threshold [m]
+
+    # prsmooth = np.full_like(gnss_df['RawPseudorangeMeters'], np.nan)
+    # prsmooth = array(rep(NA, nrow(gnss_df))) # nrow array of NAs
+    gnss_df[, idx := 1:nrow(gnss_df)]
+    unique_svid_signal = group_by(gnss_df, Svid, SignalType) |> count() |> head(3)
+    # Loop for each signal
+    with_smoothing = purrr::map2_df(
+      unique_svid_signal[["Svid"]],
+      unique_svid_signal[["SignalType"]],
+      smooth_range,
+      df_orig = gnss_df,
+      prsmooth = prsmooth
+    )
+    gnss_df = left_join(gnss_df, with_smoothing, by = "idx")
+    
+    # If carrier smoothing is not possible, use original pseudorange
+    gnss_df[ , prsmooth := ifelse(is.na(prsmooth), RawPseudorangeMeters, prsmooth)]
+    # gnss_df['pr_smooth'] = prsmooth
+
+    return(gnss_df)
+```
+
+```{r}
+smooth_range <- function(svid, signal_type, df_orig, prsmooth)
+{
+  df = df_orig[Svid == svid & SignalType == signal_type]
+  # df = df.replace({'AccumulatedDeltaRangeMeters': {0: np.nan}})  # 0 to NaN
+  df[, AccumulatedDeltaRangeMeters := ifelse(AccumulatedDeltaRangeMeters ==
+                                               0 ,
+                                             NA,
+                                             AccumulatedDeltaRangeMeters)]# 0 to NaN
+  
+  # Compare time difference between pseudorange/carrier with Doppler
+  drng1 = ave(
+    df[["AccumulatedDeltaRangeMeters"]],
+    FUN = function(x)
+      c(NA, diff(x))
+  ) - df[, 'PseudorangeRateMetersPerSecond']
+  drng2 = ave(
+    df[["RawPseudorangeMeters"]],
+    FUN = function(x)
+      c(NA, diff(x))
+  ) - df[, 'PseudorangeRateMetersPerSecond']
+  # drng1 = df['AccumulatedDeltaRangeMeters'].diff() - df['PseudorangeRateMetersPerSecond']
+  # drng2 = df['RawPseudorangeMeters'].diff() - df['PseudorangeRateMetersPerSecond']
+  
+  
+  # Check cycle-slip
+  slip1 = sapply(df[['AccumulatedDeltaRangeState']], bitwAnd, b = 2**1) != 0 # reset flag
+  slip2 = sapply(df[['AccumulatedDeltaRangeState']], bitwAnd, b = 2**2) != 0 # cycle-slip flag
+  slip3 = abs(drng1[['PseudorangeRateMetersPerSecond']]) > carr_th  # Carrier phase jump
+  slip4 = abs(drng2[["PseudorangeRateMetersPerSecond"]]) > pr_th # Pseudorange jump
+  
+  idx_slip = slip1 | slip2 | slip3 | slip4
+  idx_slip[1] = TRUE
+  
+  # change NA to FALSE
+  idx_slip[is.na(idx_slip)] <- FALSE
+  
+  # groups with continuous carrier phase tracking
+  # add column of cumsum
+  df[, group_slip := cumsum(idx_slip)]
+  
+  # Psudorange - carrier phase
+  df[, dpc := RawPseudorangeMeters - AccumulatedDeltaRangeMeters]
+  
+  # Absolute distance bias of carrier phase
+  mean_dpc = df [, .(dpc_Mean = mean(dpc)), by = group_slip]
+  df = merge(df, mean_dpc, by = "group_slip")
+  
+  # Carrier phase + bias
+  df[, prsmooth := AccumulatedDeltaRangeMeters + dpc_Mean]
+
+  return(df[, .(idx, prsmooth)])
+}
+```
+
+```{python}
+import numpy as np
+df = r.df
+drng1 = df['AccumulatedDeltaRangeMeters'].diff() - df['PseudorangeRateMetersPerSecond']
+drng2 = df['RawPseudorangeMeters'].diff() - df['PseudorangeRateMetersPerSecond']
+
+        # Check cycle-slip
+        slip1 = (df['AccumulatedDeltaRangeState'].to_numpy() & 2**1) != 0  # reset flag
+        slip2 = (df['AccumulatedDeltaRangeState'].to_numpy() & 2**2) != 0  # cycle-slip flag
+        slip3 = np.fabs(drng1.to_numpy()) > r.carr_th # Carrier phase jump
+        slip4 = np.fabs(drng2.to_numpy()) >r.pr_th # Pseudorange jump
+
+        idx_slip = slip1 | slip2 | slip3 | slip4
+        idx_slip[0] = True
+
+        # groups with continuous carrier phase tracking
+        df['group_slip'] = np.cumsum(idx_slip)
+
+        # Psudorange - carrier phase
+        df['dpc'] = df['RawPseudorangeMeters'] - df['AccumulatedDeltaRangeMeters']
+
+        # Absolute distance bias of carrier phase
+        meandpc = df.groupby('group_slip')['dpc'].mean()
+        df = df.merge(meandpc, on='group_slip', suffixes=('', '_Mean'))
+
+        # Index of original gnss_df
+        idx = (gnss_df['Svid'] == svid_sigtype[0]) & (
+            gnss_df['SignalType'] == svid_sigtype[1])
+idx = df['idx']
+idx
+        # Carrier phase + bias
+         df['AccumulatedDeltaRangeMeters']
+         
+        prsmooth[idx] = df['AccumulatedDeltaRangeMeters'] + df['dpc_Mean']
+        prsmooth[5317]
+         prsmooth[~np.isnan(prsmooth)][0:5]
+         prsmooth = np.full_like(r.gnss_df['RawPseudorangeMeters'], np.nan)
+```
+
+
+```{r}
+# R gets aborted
+# KalmanSmooth(gnss_df$WlsPositionXEcefMeters, mod = list("a", "Pn"))
+```
+
+
+
+
+```{r get score, eval=FALSE, include=FALSE}
+# baseline score
+scores = purrr::map_df(trip_ids, calc_score, pred_df = blh_df)
+mean(scores$score) # 4.356924
+```
+
+```{r eval=FALSE, include=FALSE}
+ggplot(pred_df) +
+  geom_point(aes(x = LatitudeDegrees, y = LongitudeDegrees ), color = "red") +
+  geom_point(data = gt_df, aes(x = LatitudeDegrees, y = LongitudeDegrees), color = "green", size = .5)
+```
+
+Plot of raw (blue) vs smoothed (green) vs ground truth (red)
+
+```{r map them}
+library(mapview)
+
+pred_sf = sf::st_as_sf(
+    x = pred_df,
+    coords = c("LongitudeDegrees", "LatitudeDegrees"),
+    crs = 4326,
+    na.fail = FALSE
+  )
+raw_sf = sf::st_as_sf(
+    x = raw_df,
+    coords = c("LongitudeDegrees", "LatitudeDegrees"),
+    crs = 4326,
+    na.fail = FALSE)
+
+gt_sf = sf::st_as_sf(
+    x = gt,
+    coords = c("LongitudeDegrees", "LatitudeDegrees"),
+    crs = 4326,
+    na.fail = FALSE
+  )
+mapviewOptions(basemaps = c('Esri.WorldImagery'))
+mapview::mapview(pred_sf, col.regions = "green") + mapview(gt_sf, col.regions = "red") + mapview(raw_sf, col.regions = "blue")
+```
+
+```{r eval=FALSE, include=FALSE}
+# I don't know why this doesn't work in R
+optimize <- function(threshold, window_len, poly_order) {
+  # optimize <- function(params) {
+  # threshold = unlist(threshold)
+  # window_len = unlist(window_len)
+  # poly_order = unlist(poly_order)
+  # message(params[threshold])
+  # params['threshold']
+  # threshold |> unlist()
+  # print(threshold)
+  # params$threshold
+  # window_len = as.integer(window_len)
+  # must be odd
+  # if (window_len %% 2 == 0) {
+  #   window_len = window_len + 1
+  # }
+  return(3)
+}
+# https://rpubs.com/Argaadya/bayesian-optimization
+space1 = tuple(threshold = c(1.5, 2.5), 
+         window_len = c(7, 31),
+         poly_order = c(2, 6))
+search_grid <- data.frame(threshold = runif(20,1.5,2.5),
+                          window_len = runif(20,7,31),
+                          poly_order = runif(20,2,6))
+rBayesianOptimization::BayesianOptimization(FUN = optimize, bounds = space, init_grid_dt = search_grid, n_iter = 2)
+library(reticulate)
+py$result$x
+optimize(list(1.88, 13, 4))
+py$gp_minimize(optimize, r_to_py(space1), n_cblh_dfs=10)
+
+py_to_r(py$space)
+```
+
+```{python eval=FALSE, include=FALSE}
+from skopt import gp_minimize
+from skopt.space import Real, Integer
+
+space = [Real(1.5, 2.5, name='threshold'), 
+         Integer(7, 31, name='window_len'), 
+         Integer(2, 6, name='poly_order')]
+
+result = gp_minimize(r.optimize, space, n_calls=10) # works!
+result
+
+# Make sure wl is odd, wl be > than poly
+if result.x[1]%2==0:
+    result.x[1]+=1
+
+print(f'best params:\noutlier threshhold: {result.x[0]}\nsavgol filter window length: {result.x[1]}\nsavgol filter poly order: {result.x[2]}')
+result.x
+result.fun
+# for blh_df score 3.935 [2.3059423828286683, 9, 2]
+```
+
+```{r eval=FALSE, include=FALSE}
+# let's apply this optimize parameters
+threshold = 2.3059423828286683
+window_len = 9
+poly_order = 2
+score_list = data.frame()
+
+  for (i in 1:length(trip_ids)) {
+    trip = trip_ids[i]
+    
+    pred_df = blh_df[tripID == trip]
+    
+    # We are using BLH, not ECEF to optimize
+    pred_df = correct_outliers(pred_df, threshold) |> setDT() # ??
+    pred_df = apply_savgol_filter(tripID, df = pred_df, wl = window_len, poly_order)
+    # print(pred_df)
+    score = calc_score(trip, pred_df)
+    score_list = bind_rows(score_list, score)
+  }
+mean(score_list$score) # 3.934705
+```
