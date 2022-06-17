@@ -159,13 +159,6 @@ pr_residuals <- function(x, xsat, pr, W){
 # Formula: OMGE * (Y*0 - X*0) / CLIGHT - add this to rng
    
    to_add = rng + (OMGE * (xsat[, 1] * x[2] - xsat[, 2] * x[1]) / CLIGHT)
-    # u = cbind(u[ ,1:3], rng = to_add[ ,1])
-    # u = u[, 4]
-    # sweep(u, 1, pr - x[4])
-    # Add GPS L1 clock offset
-    # residuals = u[, 4] - (pr - x[4])
-    # residuals = sweep(u, 1, pr - x[4])
-    # residuals = residuals[ ,4]# |> as.matrix()
     residuals = to_add - (pr - x[4])
     return(array(W %*% residuals))
 }
@@ -201,13 +194,16 @@ prr_residuals <- function(v, vsat, prr, x, xsat, W) {
         residuals*W : pseudorange rate residuals
     "
   # u is XYZ then rng
-  u = los_vector(x[1:3], xsat)
-  
-  rate = -rowSums((vsat[, 1:3] - v[1:3]) * u[, 1:3]) +
+  u = los_vector(x[1:3], xsat)[,1:3]
+  # print(rowSums((vsat[, 1:3] - v[1:3])))
+  # print(vsat[, 1:3] - v[1:3] )
+  # print(sweep(vsat[ , 1:3], 2, - v[1:3])*u)
+  rate = rowSums(sweep(vsat[ , 1:3], 2, - v[1:3])*u) +
     OMGE / CLIGHT * (vsat[, 2] * x[1] + xsat[, 2] * v[1] - vsat[, 1] * x[2] - xsat[, 1] * v[2]) |> as.matrix()
   
   residuals = rate - (prr - v[4])
   residuals = as.array(residuals[, 1])
+  
   return(array(residuals %*% W))
   
 }
@@ -397,10 +393,9 @@ library(reticulate)
 # pr = as.matrix(pr)
 # x0 = as.matrix(x0)
 lapply(list(x0, xsat_pr, pr, Wx), class)
+lapply(list(v0, vsat, prr, Wv, xsat_prr), class)
 py$wls(pr_residuals, x0, jac_pr_residuals, args= c(xsat_pr, pr, Wx))
 # py$least_squares(pr_residuals, x0, jac_pr_residuals, args= c(xsat_pr, pr, Wx))
-
-count(gnss_df, utcTimeMillis)
 ```
 
 
@@ -409,16 +404,10 @@ from scipy.optimize import least_squares
 import numpy as np
 wls = least_squares
 import scipy
-scipy.optimize.least_squares(r.pr_residuals, r.x0, r.jac_pr_residuals, args=(r.xsat_pr, pr, r.Wx), loss='soft_l1')
-pr = r.pr
-df_pr = r.df
-x = np.zeros(4)
-xsat_pr = np.array(r.xsat_pr)
-# pr = (df_pr['SvClockBiasMeters'] - df_pr['IsrbMeters'] -           df_pr['IonosphericDelayMeters'] - df_pr['TroposphericDelayMeters']).to_numpy()
-Wx = np.array(r.Wx)
+scipy.optimize.least_squares(r.pr_residuals, r.x0, r.jac_pr_residuals, args=(r.xsat_pr, pr, r.Wx))
 
-scipy.optimize.least_squares(r.pr_residuals, x, r.jac_pr_residuals, args=(xsat_pr, pr, Wx), loss='soft_l1')
-Wx
+scipy.optimize.least_squares(r.prr_residuals, r.v0, r.jac_prr_residuals, args=(r.vsat, r.prr, r.x0, r.xsat_prr, r.Wv))
+
 # r.jac_pr_residuals(r.x0, r.xsat_pr, r.pr, r.Wx)
 # r.pr_residuals(r.x0, r.xsat_pr, r.pr, r.Wx)
 # r.prr_residuals(r.v0, r.vsat, r.prr, r.x0, r.xsat_prr, r.Wv)
