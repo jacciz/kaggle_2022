@@ -57,7 +57,6 @@ gnss_df = read.csv(paste0(path, one_trip, "/device_gnss.csv")) |> setDT()
 
 ```{r satellite selection}
 # Satellite selection using carrier frequency error, elevation angle, and C/N0
-# TODO CarrierErrorHz not in df ??
 satellite_selection <- function(gnss_df, column) {
   "
     Args:
@@ -74,6 +73,7 @@ satellite_selection <- function(gnss_df, column) {
   match = which(!is.na(gnss_df[[column]]) &
                   gnss_df[["SvElevationDegrees"]] > 10.0 &
                   gnss_df[["Cn0DbHz"]] > 15.0 &
+                  gnss_df[["CarrierErrorHz"]] < 2.0e6 &
                   gnss_df[["MultipathIndicator"]] == 0,
                 arr.ind = T)
   
@@ -84,12 +84,8 @@ satellite_selection <- function(gnss_df, column) {
 
 ```{r residuals and jacobian}
 # Compute line-of-sight vector from user to satellite
-# input is a matrix?
+
 # Returns XYZ and rng
-# xsat_pr - x0[1:3]
-# xsat_pr - as.array(c(1,2,3))
-# 
-# m = as.matrix(x0[1:3] - xsat_pr, ncol = 3)
 
 los_vector <- function(xusr, xsat) {
   "
@@ -101,7 +97,8 @@ los_vector <- function(xusr, xsat) {
         rng: distance between user and satellite (m)
     "
   # Take inverse of xsat
-  m = as.matrix(xusr - xsat, ncol = 3)
+  # m = as.matrix(xusr - xsat, ncol = 3)
+  m = sweep(xsat, 2, -xusr) # I think it should be negative?
   rng = apply(m, 1, pracma::Norm) |> matrix(ncol = 1)
   # |>  matrix(dimnames=list(t(outer(colnames(m), rownames(m), FUN=paste)), NULL))
   
@@ -122,23 +119,9 @@ los_vector <- function(xusr, xsat) {
 }
 ```
 
-```{python}
-import pandas as pd
-import numpy as np
-x = np.zeros(4) 
-  u = x[:3] - r.xsat
-    rng = np.linalg.norm(u, axis=1).reshape(-1, 1)
-    u /= rng
-r.m, r.rng.reshape(-1)
-u[:2]
-r.residuals @ r.Wx
-u
-rng
-r.x[:3]
-```
-
 ```{r jacobian}
 # Compute Jacobian matrix
+# TODO haystack?
 jac_pr_residuals <- function(x, xsat, pr, W) {
   "
     Args:
@@ -150,8 +133,10 @@ jac_pr_residuals <- function(x, xsat, pr, W) {
         W*J : Jacobian matrix
     "
   u = los_vector(x[1:3], xsat)
-  J = cbind(u[, 1:3], rep(1, nrow(u)))
-  return(array(W %*% J))
+  u = u[, 1:3]
+  J = cbind(u, rep(1, nrow(u)))
+  # return(array(W %*% J))
+  return(as.matrix(W %*% J, ncol = 4))
 }
 # x = x0
 # xsat = xsat_pr
@@ -168,17 +153,20 @@ pr_residuals <- function(x, xsat, pr, W){
         residuals*W : pseudorange residuals
     "
     # u, rng = los_vector(x, xsat)
-   u = los_vector(x[1:3], xsat)
+   rng = los_vector(x[1:3], xsat)[, 4]
    # u is XYZ, rng is last column
     # Approximate correction of the earth rotation (Sagnac effect) often used in GNSS positioning
 # Formula: OMGE * (Y*0 - X*0) / CLIGHT - add this to rng
    
-   to_add = u[, 4] + (OMGE * (xsat[, 1] * x[2] - xsat[, 2] * x[1]) / CLIGHT) |> as.matrix()
-    u = cbind(u[ ,1:3], rng = to_add[ ,1])
-    
+   to_add = rng + (OMGE * (xsat[, 1] * x[2] - xsat[, 2] * x[1]) / CLIGHT)
+    # u = cbind(u[ ,1:3], rng = to_add[ ,1])
+    # u = u[, 4]
+    # sweep(u, 1, pr - x[4])
     # Add GPS L1 clock offset
-    residuals = u[, 4] - (pr - x[4])
-
+    # residuals = u[, 4] - (pr - x[4])
+    # residuals = sweep(u, 1, pr - x[4])
+    # residuals = residuals[ ,4]# |> as.matrix()
+    residuals = to_add - (pr - x[4])
     return(array(W %*% residuals))
 }
 
@@ -195,7 +183,8 @@ jac_prr_residuals <- function(v, vsat, prr, x, xsat, W) {
         W*J : Jacobian matrix"
   u = los_vector(x[1:3], vsat)
   J = cbind(u[, 1:3], rep(1, nrow(u)))
-  return(array(W %*% J))
+  # return(array(W %*% J))
+  return(as.matrix(W %*% J, ncol = 4))
 }
 
 # Compute pseudorange rate residuals
@@ -220,6 +209,7 @@ prr_residuals <- function(v, vsat, prr, x, xsat, W) {
   residuals = rate - (prr - v[4])
   residuals = as.array(residuals[, 1])
   return(array(residuals %*% W))
+  
 }
 # prr_residuals(v0, vsat, prr, x0, xsat_prr, Wv)
 ```
@@ -320,7 +310,7 @@ point_positioning <- function(gnss_df){
     hz_ref = gnss_df[ , list(CarrierFrequencyHzRef=median(CarrierFrequencyHz)), by=.(Svid, SignalType)]
     
     gnss_df = left_join(gnss_df, hz_ref, by = c("Svid", "SignalType"))
-gnss_df[ , CarrierErrorHz := abs(CarrierFrequencyHz - CarrierFrequencyHzRef) ]
+    gnss_df[ , "CarrierErrorHz" := abs(CarrierFrequencyHz - CarrierFrequencyHzRef) ]
     
     # Carrier smoothing
     gnss_df = carrier_smoothing(gnss_df)
@@ -396,67 +386,43 @@ gnss_df[ , CarrierErrorHz := abs(CarrierFrequencyHz - CarrierFrequencyHzRef) ]
 
     return(utcTimeMillis, x_wls, v_wls)
 }
-
+# They all work
 pr_residuals(x0, xsat_pr, pr, Wx)
 jac_pr_residuals(x0, xsat_pr, pr, Wx) 
 prr_residuals(v0, vsat, prr, x0, xsat_prr, Wv)
 jac_prr_residuals(v0, vsat, prr, x0, xsat_prr, Wv)
-
+```
+```{r}
+library(reticulate)
+# pr = as.matrix(pr)
+# x0 = as.matrix(x0)
+lapply(list(x0, xsat_pr, pr, Wx), class)
 py$wls(pr_residuals, x0, jac_pr_residuals, args= c(xsat_pr, pr, Wx))
+# py$least_squares(pr_residuals, x0, jac_pr_residuals, args= c(xsat_pr, pr, Wx))
+
+count(gnss_df, utcTimeMillis)
 ```
 
-```{python}
-np.zeros(4)
-x=np.diag(1 / r.df_pr['RawPseudorangeUncertaintyMeters'].to_numpy())
 
+```{python}
 from scipy.optimize import least_squares
+import numpy as np
 wls = least_squares
 import scipy
-scipy.optimize.least_squares(r.pr_residuals, r.x0, r.jac_pr_residuals, args=(r.xsat_pr, r.pr, r.Wx), loss='soft_l1')
-# r.jac_pr_residuals(r.x0, r.xsat_pr_m, r.pr_a, r.Wx)
-# r.pr_residuals(r.x0, r.xsat_pr_m, r.pr, r.Wx)
-# r.prr_residuals(r.v0, r.vsat_m, r.prr, r.x0, r.xsat_prr_m, r.Wv)
-# r.jac_prr_residuals(r.v0, r.vsat_m, r.prr, r.x0, r.xsat_prr_m, r.Wv)
-```
+scipy.optimize.least_squares(r.pr_residuals, r.x0, r.jac_pr_residuals, args=(r.xsat_pr, pr, r.Wx), loss='soft_l1')
+pr = r.pr
+df_pr = r.df
+x = np.zeros(4)
+xsat_pr = np.array(r.xsat_pr)
+# pr = (df_pr['SvClockBiasMeters'] - df_pr['IsrbMeters'] -           df_pr['IonosphericDelayMeters'] - df_pr['TroposphericDelayMeters']).to_numpy()
+Wx = np.array(r.Wx)
 
-```{r}
-to_add
-pr_residuals <- function(x, xsat, pr, W){
-    "
-    Args:
-        x : current position in ECEF (m)
-        xsat : satellite position in ECEF (m)
-        pr : pseudorange (m)
-        W : weight matrix
-    Returns:
-        residuals*W : pseudorange residuals
-    "
-    # u, rng = los_vector(x, xsat)
-   u = los_vector(x[1:3], xsat)
-   # u is XYZ, rng is last column
-    # Approximate correction of the earth rotation (Sagnac effect) often used in GNSS positioning
-# Formula: OMGE * (Y*0 - X*0) / CLIGHT - add this to rng
-   
-   to_add = u[, 4] + (OMGE * (xsat[, 1] * x[2] - xsat[, 2] * x[1]) / CLIGHT) |> as.matrix()
-   # u = u[,]
-   u = cbind(u[ ,1:3], rng = to_add[ ,1])
-    # u[, 4] = to_add[['SvPositionXEcefMeters']]
- 
-   #  
-   #  # Add GPS L1 clock offset
-   #  residuals = u[, 4] - (pr - x[4])
-to_add[ ,1]
-    # return(array(W %*% residuals))
-   return(u)
-}
-```
-
-
-```{python}
-u = r.los_vector(r.x0[1:3], r.xsat_pr_m)
-   # u is XYZ, rng is last column
-    # Approximate correction of the earth rotation (Sagnac effect) often used in GNSS positioning
-# Formula: OMGE * (Y*0 - X*0) / CLIGHT - add this to rng
+scipy.optimize.least_squares(r.pr_residuals, x, r.jac_pr_residuals, args=(xsat_pr, pr, Wx), loss='soft_l1')
+Wx
+# r.jac_pr_residuals(r.x0, r.xsat_pr, r.pr, r.Wx)
+# r.pr_residuals(r.x0, r.xsat_pr, r.pr, r.Wx)
+# r.prr_residuals(r.v0, r.vsat, r.prr, r.x0, r.xsat_prr, r.Wv)
+# r.jac_prr_residuals(r.v0, r.vsat, r.prr, r.x0, r.xsat_prr, r.Wv)
 ```
 
 ```{r}
