@@ -58,18 +58,12 @@ gnss_df = read.csv(paste0(path, one_trip, "/device_gnss.csv")) |> setDT()
 ```{r satellite selection}
 # Satellite selection using carrier frequency error, elevation angle, and C/N0
 satellite_selection <- function(gnss_df, column) {
-  "
-    Args:
+    "Args:
         df : DataFrame from device_gnss.csv
         column : Column name
     Returns:
-        df: DataFrame with eliminated satellite signals
-    "
-  # Returns booleon for isNull
-  # idx = df[column].notnull()
-  # # Row number for parameter
-  # idx &= df['CarrierErrorHz'] < 2.0e6  # carrier frequency error (Hz) 
-  #
+        df: DataFrame with eliminated satellite signals"
+
   match = which(!is.na(gnss_df[[column]]) &
                   gnss_df[["SvElevationDegrees"]] > 10.0 &
                   gnss_df[["Cn0DbHz"]] > 15.0 &
@@ -111,10 +105,6 @@ los_vector <- function(xusr, xsat) {
       "SvPositionZEcefMeters",
       "rng"
     )
-  # rng = np.linalg.norm(u, axis=1).reshape(-1, 1)
-  # m = m / rng
-  # u is long format, rng is wide format ?
-  # return u, rng.reshape(-1)
   return(m)
 }
 ```
@@ -135,32 +125,29 @@ jac_pr_residuals <- function(x, xsat, pr, W) {
   u = los_vector(x[1:3], xsat)
   u = u[, 1:3]
   J = cbind(u, rep(1, nrow(u)))
+  
   # return(array(W %*% J))
   return(as.matrix(W %*% J, ncol = 4))
 }
-# x = x0
-# xsat = xsat_pr
-# x0, jac_pr_residuals, args=(xsat_pr, pr, Wx)
+
 # Compute pseudorange residuals
-pr_residuals <- function(x, xsat, pr, W){
-    "
-    Args:
+pr_residuals <- function(x, xsat, pr, W) {
+  "Args:
         x : current position in ECEF (m)
         xsat : satellite position in ECEF (m)
         pr : pseudorange (m)
         W : weight matrix
     Returns:
-        residuals*W : pseudorange residuals
-    "
-    # u, rng = los_vector(x, xsat)
-   rng = los_vector(x[1:3], xsat)[, 4]
-   # u is XYZ, rng is last column
-    # Approximate correction of the earth rotation (Sagnac effect) often used in GNSS positioning
-# Formula: OMGE * (Y*0 - X*0) / CLIGHT - add this to rng
-   
-   to_add = rng + (OMGE * (xsat[, 1] * x[2] - xsat[, 2] * x[1]) / CLIGHT)
-    residuals = to_add - (pr - x[4])
-    return(array(W %*% residuals))
+        residuals*W : pseudorange residuals"
+  
+  rng = los_vector(x[1:3], xsat)[, 4]
+  # Approximate correction of the earth rotation (Sagnac effect) often used in GNSS positioning
+  # Formula: OMGE * (Y*0 - X*0) / CLIGHT - add this to rng
+  
+  to_add = rng + (OMGE * (xsat[, 1] * x[2] - xsat[, 2] * x[1]) / CLIGHT)
+  residuals = to_add - (pr - x[4])
+  
+  return(array(W %*% residuals))
 }
 
 # Compute Jacobian matrix
@@ -207,7 +194,6 @@ prr_residuals <- function(v, vsat, prr, x, xsat, W) {
   return(array(residuals %*% W))
   
 }
-# prr_residuals(v0, vsat, prr, x0, xsat_prr, Wv)
 ```
 
 ```{r smoothing}
@@ -215,12 +201,10 @@ prr_residuals <- function(v, vsat, prr, x, xsat, W) {
   pr_th =  20.0 # pseudorange jump threshold [m]
 # Carrier smoothing of pseudarange
 carrier_smoothing <- function(gnss_df) {
-  "
-    Args:
+  "Args:
         df : DataFrame from device_gnss.csv
     Returns:
-        df: DataFrame with carrier-smoothing pseudorange 'pr_smooth'
-    "
+        df: DataFrame with carrier-smoothing pseudorange 'pr_smooth'"
   # carr_th = 2.0 # carrier phase jump threshold [m]
   # pr_th =  20.0 # pseudorange jump threshold [m]
   
@@ -300,7 +284,7 @@ smooth_range <- function(svid, signal_type, df_orig, prsmooth)
 
 ```{r}
 # GNSS single point positioning using pseudorange
-point_positioning <- function(gnss_df){   
+point_positioning <- function(gnss_df){
   # Add nominal frequency to each signal
   # Note: GLONASS is an FDMA signal, so each satellite has a different frequency
     hz_ref = gnss_df[ , list(CarrierFrequencyHzRef=median(CarrierFrequencyHz)), by=.(Svid, SignalType)]
@@ -316,11 +300,18 @@ point_positioning <- function(gnss_df){
     nepoch = length(utcTimeMillis)
     x0 = c(rep(0, 4))  # [x,y,z,tGPSL1]
     v0 = c(rep(0, 4))  # [vx,vy,vz,dtGPSL1]
+   
     
-    x_wls = matrix(NA, nrow = nepoch, ncol = 3) # For saving position
-    v_wls = matrix(NA, nrow = nepoch, ncol = 3) # For saving velocity
-
+    x_wls = matrix(NA, nrow = nepoch, ncol = 4) # For saving position
+    v_wls = matrix(NA, nrow = nepoch, ncol = 4) # For saving velocity
+    cov_x = array(NA,dim=c(4, 4, nepoch))
+    cov_y = array(NA,dim=c(4, 4, nepoch))
+    
     # Loop for epochs 
+    for (i in 1:nepoch){
+      print(utcTimeMillis[i]) # the time
+      print(i)
+    }
     # TODO
     df = gnss_df[utcTimeMillis == 1590097058443]
     # for i, (t_utc, df) in enumerate(tqdm(gnss_df.groupby('utcTimeMillis'), total=nepoch)):
@@ -348,46 +339,23 @@ point_positioning <- function(gnss_df){
 
         # Robust WLS requires accurate initial values for convergence,
         # so perform normal WLS for the first time
-        if (length(df_pr) >= 4){
-            # Normal WLS
-            if (all(x0 == 0)){
-          # TODO
-                opt = py$wls(pr_residuals, x0, jac_pr_residuals, args= c(xsat_pr, pr, Wx))
-                x0 = opt.x 
-                }
-            # Robust WLS for position estimation
-            opt = scipy.optimize.least_squares(
-                 pr_residuals, x0, jac_pr_residuals, args=(xsat_pr, pr, Wx), loss='soft_l1')
-            if (opt.status < 1 or opt.status == 2){
-                 print(f'i = {i} position lsq status = {opt.status}')}
-            else{
-                 x_wls[i, :] = opt.x[:3]
-                 x0 = opt.x}
-        }
-        # Velocity estimation
-        if (length(df_prr) >= 4){
-            if (all(v0 == 0)){ # Normal WLS
-                opt = scipy.optimize.least_squares(
-                    prr_residuals, v0, jac_prr_residuals, args=(vsat, prr, x0, xsat_prr, Wv))
-                v0 = opt.x
-            # Robust WLS for velocity estimation
-            opt = scipy.optimize.least_squares(
-                prr_residuals, v0, jac_prr_residuals, args=(vsat, prr, x0, xsat_prr, Wv), loss='soft_l1')}
-            if (opt.status < 1){
-                print(f'i = {i} velocity lsq status = {opt.status}')}
-            else{
-                v_wls[i, :] = opt.x[:3]
-                v0 = opt.x}
-        }
+        # if (length(df_pr) >= 4){}
+        source_python("optimize_ls.py") # new x0 and cov
+        # TODO replace 1 with i
+        cov_x[,,1] = cov
+        x_wls[1,] = opt$x
+        x0 = opt$x
 
-    return(utcTimeMillis, x_wls, v_wls)
+    # return(utcTimeMillis, x_wls, v_wls, cov_x, cov_v)
 }
 # They all work
 pr_residuals(x0, xsat_pr, pr, Wx)
-jac_pr_residuals(x0, xsat_pr, pr, Wx) 
+jac_pr_residuals(x0, xsat_pr, pr, Wx)
 prr_residuals(v0, vsat, prr, x0, xsat_prr, Wv)
 jac_prr_residuals(v0, vsat, prr, x0, xsat_prr, Wv)
+# pracma::jacobian(pr_residuals , x0, xsat = xsat_pr, pr = pr, W = Wx) # same as jac_pr_res
 ```
+
 ```{r}
 library(reticulate)
 # pr = as.matrix(pr)
@@ -395,19 +363,38 @@ library(reticulate)
 lapply(list(x0, xsat_pr, pr, Wx), class)
 lapply(list(v0, vsat, prr, Wv, xsat_prr), class)
 py$wls(pr_residuals, x0, jac_pr_residuals, args= c(xsat_pr, pr, Wx))
-# py$least_squares(pr_residuals, x0, jac_pr_residuals, args= c(xsat_pr, pr, Wx))
+
+pr_l = np_array(pr)
+# TODO
+x0_v = np_array(x0)
+py$least_squares(pr_residuals, x0_v, args= c(xsat_pr, pr_l, Wx))
+
+source_python("optimize_ls.py")
+
+# py_run_file("optimize_ls.py")
+dim(least_squares)
+a$ls
+
+difflib <- import("scipy")
+difflib$optimize.least_squares(foo, bar)
+gslnls::gsl_nls(pr_residuals(x0, xsat_pr, pr_l, Wx))
 ```
 
 
 ```{python}
+r.Wx
+# list nparray list nparray
+type(r.Wx)
 from scipy.optimize import least_squares
 import numpy as np
-wls = least_squares
-import scipy
-scipy.optimize.least_squares(r.pr_residuals, r.x0, r.jac_pr_residuals, args=(r.xsat_pr, pr, r.Wx))
+# wls = least_squares
+# import scipy
+ls = least_squares(r.pr_residuals, r.x0, r.jac_pr_residuals, args=(r.xsat_pr, r.pr, r.Wx))
+x02 = ls.x
+least_squares(r.prr_residuals, r.v0, r.jac_prr_residuals, args=(r.vsat, r.prr, r.x0, r.xsat_prr, r.Wv))
 
-scipy.optimize.least_squares(r.prr_residuals, r.v0, r.jac_prr_residuals, args=(r.vsat, r.prr, r.x0, r.xsat_prr, r.Wv))
-
+opt = least_squares(r.pr_residuals, x02, r.jac_pr_residuals, args=(r.xsat_pr, r.pr, r.Wx))
+opt.jac.T @ r.Wx
 # r.jac_pr_residuals(r.x0, r.xsat_pr, r.pr, r.Wx)
 # r.pr_residuals(r.x0, r.xsat_pr, r.pr, r.Wx)
 # r.prr_residuals(r.v0, r.vsat, r.prr, r.x0, r.xsat_prr, r.Wv)
